@@ -1,0 +1,636 @@
+# docker-compose.yml - Complete FinGuard AI Stack
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: finguard-postgres
+    environment:
+      POSTGRES_DB: finguard_db
+      POSTGRES_USER: finguard_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finguard_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finguard-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: finguard-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - finguard-network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: finguard-backend
+    environment:
+      - DATABASE_URL=postgresql://finguard_user:${DB_PASSWORD:-changeme123}@postgres:5432/finguard_db
+      - REDIS_URL=redis://redis:6379
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ALPHA_VANTAGE_KEY=${ALPHA_VANTAGE_KEY}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - ENVIRONMENT=production
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - finguard-network
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: finguard-frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_STRIPE_PUBLIC_KEY=${STRIPE_PUBLIC_KEY}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - finguard-network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: finguard-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - finguard-network
+
+  # Background Task Worker (Celery)
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: finguard-worker
+    environment:
+      - DATABASE_URL=postgresql://finguard_user:${DB_PASSWORD:-changeme123}@postgres:5432/finguard_db
+      - REDIS_URL=redis://redis:6379
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A tasks worker --loglevel=info
+    volumes:
+      - ./backend:/app
+    networks:
+      - finguard-network
+
+  # Celery Beat Scheduler (for scheduled rebalancing)
+  scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: finguard-scheduler
+    environment:
+      - DATABASE_URL=postgresql://finguard_user:${DB_PASSWORD:-changeme123}@postgres:5432/finguard_db
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A tasks beat --loglevel=info
+    volumes:
+      - ./backend:/app
+    networks:
+      - finguard-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  finguard-network:
+    driver: bridge
+
+---
+# backend/Dockerfile
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create logs directory
+RUN mkdir -p /app/logs
+
+# Expose port
+EXPOSE 8000
+
+# Run application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+---
+# frontend/Dockerfile
+
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy application code
+COPY . .
+
+# Build application
+RUN npm run build
+
+# Expose port
+EXPOSE 3000
+
+# Start application
+CMD ["npm", "start"]
+
+---
+# nginx/nginx.conf
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream backend {
+        server backend:8000;
+    }
+
+    upstream frontend {
+        server frontend:3000;
+    }
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=web_limit:10m rate=30r/s;
+
+    server {
+        listen 80;
+        server_name finguard.ai www.finguard.ai;
+
+        # Redirect to HTTPS
+        return 301 https://$server_name$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name finguard.ai www.finguard.ai;
+
+        # SSL Configuration
+        ssl_certificate /etc/nginx/ssl/cert.pem;
+        ssl_certificate_key /etc/nginx/ssl/key.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+
+        # Security headers
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+        # API Routes
+        location /api/ {
+            limit_req zone=api_limit burst=20 nodelay;
+            
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_cache_bypass $http_upgrade;
+            
+            # Timeouts
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+        }
+
+        # WebSocket support for real-time updates
+        location /ws/ {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        # Frontend Routes
+        location / {
+            limit_req zone=web_limit burst=50 nodelay;
+            
+            proxy_pass http://frontend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_cache_bypass $http_upgrade;
+        }
+
+        # Static files caching
+        location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf)$ {
+            proxy_pass http://frontend;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+    }
+}
+
+---
+# .env.example - Environment Variables Template
+
+# Database
+DATABASE_URL=postgresql://finguard_user:changeme123@localhost:5432/finguard_db
+DB_PASSWORD=changeme123
+
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# Security
+SECRET_KEY=your-super-secret-key-change-this-in-production
+JWT_SECRET_KEY=your-jwt-secret-key
+
+# AI Models
+ANTHROPIC_API_KEY=your-anthropic-api-key
+OPENAI_API_KEY=your-openai-api-key
+
+# Financial APIs
+ALPHA_VANTAGE_KEY=your-alpha-vantage-key
+COINGECKO_API_KEY=your-coingecko-key
+
+# Payment Processing
+STRIPE_SECRET_KEY=sk_test_your-stripe-secret-key
+STRIPE_PUBLIC_KEY=pk_test_your-stripe-public-key
+STRIPE_WEBHOOK_SECRET=whsec_your-webhook-secret
+
+# Trading APIs (Optional - for live trading)
+ZERODHA_API_KEY=your-zerodha-key
+ZERODHA_API_SECRET=your-zerodha-secret
+BINANCE_API_KEY=your-binance-key
+BINANCE_API_SECRET=your-binance-secret
+
+# Application
+ENVIRONMENT=development
+API_URL=http://localhost:8000
+FRONTEND_URL=http://localhost:3000
+ALLOWED_ORIGINS=http://localhost:3000,https://finguard.ai
+
+# Email (for notifications)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=your-app-password
+
+# Monitoring
+SENTRY_DSN=your-sentry-dsn
+
+---
+# init-db.sql - Database Initialization Script
+
+-- Create extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Create enum types
+CREATE TYPE subscription_tier AS ENUM ('free', 'basic', 'premium', 'enterprise');
+CREATE TYPE action_type AS ENUM ('rebalance', 'trade', 'alert', 'config_change');
+CREATE TYPE risk_level AS ENUM ('low', 'medium', 'high');
+CREATE TYPE asset_category AS ENUM ('stocks', 'crypto', 'bonds', 'etfs', 'commodities');
+
+-- Create indexes for performance
+CREATE INDEX idx_audit_logs_user_timestamp ON audit_logs(user_id, timestamp DESC);
+CREATE INDEX idx_audit_logs_hash ON audit_logs(hash_chain);
+CREATE INDEX idx_holdings_symbol ON holdings(symbol);
+CREATE INDEX idx_market_data_symbol_timestamp ON market_data(symbol, timestamp DESC);
+
+-- Create function for automatic timestamp updates
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$ language 'plpgsql';
+
+-- Apply timestamp trigger to relevant tables
+CREATE TRIGGER update_portfolios_updated_at 
+    BEFORE UPDATE ON portfolios 
+    FOR EACH ROW 
+    EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_holdings_updated_at 
+    BEFORE UPDATE ON holdings 
+    FOR EACH ROW 
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- Create view for portfolio analytics
+CREATE OR REPLACE VIEW portfolio_analytics AS
+SELECT 
+    p.id AS portfolio_id,
+    p.user_id,
+    p.total_value,
+    COUNT(h.id) AS total_holdings,
+    SUM(CASE WHEN h.category = 'stocks' THEN h.quantity * h.current_price ELSE 0 END) AS stocks_value,
+    SUM(CASE WHEN h.category = 'crypto' THEN h.quantity * h.current_price ELSE 0 END) AS crypto_value,
+    SUM(CASE WHEN h.category = 'bonds' THEN h.quantity * h.current_price ELSE 0 END) AS bonds_value,
+    SUM(CASE WHEN h.category = 'etfs' THEN h.quantity * h.current_price ELSE 0 END) AS etfs_value,
+    p.updated_at
+FROM portfolios p
+LEFT JOIN holdings h ON p.id = h.portfolio_id
+GROUP BY p.id, p.user_id, p.total_value, p.updated_at;
+
+-- Grant permissions
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO finguard_user;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO finguard_user;
+
+---
+# deployment/deploy.sh - Deployment Script
+
+#!/bin/bash
+
+set -e
+
+echo "🚀 FinGuard AI Deployment Script"
+echo "================================="
+
+# Check if required environment variables are set
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+    echo "❌ Error: ANTHROPIC_API_KEY is not set"
+    exit 1
+fi
+
+# Load environment variables
+if [ -f .env ]; then
+    export $(cat .env | grep -v '^#' | xargs)
+    echo "✅ Loaded environment variables"
+else
+    echo "⚠️  Warning: .env file not found, using defaults"
+fi
+
+# Build and start services
+echo ""
+echo "📦 Building Docker containers..."
+docker-compose build
+
+echo ""
+echo "🔄 Starting services..."
+docker-compose up -d
+
+# Wait for database to be ready
+echo ""
+echo "⏳ Waiting for database..."
+sleep 10
+
+# Run database migrations
+echo ""
+echo "🗄️  Running database migrations..."
+docker-compose exec -T backend alembic upgrade head
+
+# Create initial admin user (optional)
+echo ""
+echo "👤 Creating admin user..."
+docker-compose exec -T backend python -c "
+from database import init_database, User
+from passlib.context import CryptContext
+
+Session = init_database()
+session = Session()
+pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
+
+admin = User(
+    id='admin-001',
+    email='admin@finguard.ai',
+    hashed_password=pwd_context.hash('ChangeMe123!'),
+    full_name='Admin User',
+    subscription_tier='enterprise',
+    is_active=True
+)
+
+session.add(admin)
+session.commit()
+print('✅ Admin user created: admin@finguard.ai / ChangeMe123!')
+" || echo "⚠️  Admin user already exists"
+
+# Health check
+echo ""
+echo "🏥 Checking service health..."
+sleep 5
+
+if curl -f http://localhost:8000/health > /dev/null 2>&1; then
+    echo "✅ Backend is healthy"
+else
+    echo "❌ Backend health check failed"
+    exit 1
+fi
+
+if curl -f http://localhost:3000 > /dev/null 2>&1; then
+    echo "✅ Frontend is healthy"
+else
+    echo "❌ Frontend health check failed"
+    exit 1
+fi
+
+echo ""
+echo "✨ Deployment completed successfully!"
+echo ""
+echo "📊 Services:"
+echo "   - Frontend: http://localhost:3000"
+echo "   - Backend API: http://localhost:8000"
+echo "   - API Docs: http://localhost:8000/docs"
+echo ""
+echo "📝 Default Admin Credentials:"
+echo "   Email: admin@finguard.ai"
+echo "   Password: ChangeMe123!"
+echo ""
+echo "🔒 IMPORTANT: Change the admin password immediately!"
+echo ""
+
+---
+# deployment/stop.sh - Stop Services
+
+#!/bin/bash
+
+echo "🛑 Stopping FinGuard AI services..."
+docker-compose down
+
+echo "✅ Services stopped"
+
+---
+# deployment/backup.sh - Database Backup Script
+
+#!/bin/bash
+
+set -e
+
+BACKUP_DIR="./backups"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+BACKUP_FILE="$BACKUP_DIR/finguard_backup_$TIMESTAMP.sql"
+
+mkdir -p $BACKUP_DIR
+
+echo "💾 Creating database backup..."
+docker-compose exec -T postgres pg_dump -U finguard_user finguard_db > $BACKUP_FILE
+
+# Compress backup
+gzip $BACKUP_FILE
+echo "✅ Backup created: ${BACKUP_FILE}.gz"
+
+# Keep only last 30 backups
+ls -t $BACKUP_DIR/finguard_backup_*.sql.gz | tail -n +31 | xargs rm -f 2>/dev/null || true
+echo "✅ Old backups cleaned up"
+
+---
+# deployment/restore.sh - Database Restore Script
+
+#!/bin/bash
+
+set -e
+
+if [ -z "$1" ]; then
+    echo "Usage: ./restore.sh <backup_file.sql.gz>"
+    exit 1
+fi
+
+BACKUP_FILE=$1
+
+if [ ! -f "$BACKUP_FILE" ]; then
+    echo "❌ Backup file not found: $BACKUP_FILE"
+    exit 1
+fi
+
+echo "⚠️  WARNING: This will overwrite the current database!"
+read -p "Are you sure? (yes/no): " -r
+if [[ ! $REPLY =~ ^yes$ ]]; then
+    echo "Restore cancelled"
+    exit 0
+fi
+
+echo "🔄 Restoring database from backup..."
+
+# Decompress and restore
+gunzip -c $BACKUP_FILE | docker-compose exec -T postgres psql -U finguard_user -d finguard_db
+
+echo "✅ Database restored successfully"
+
+---
+# Makefile - Convenience Commands
+
+.PHONY: help install dev deploy test clean logs backup
+
+help:
+	@echo "FinGuard AI - Available Commands"
+	@echo "================================"
+	@echo "  make install   - Install dependencies"
+	@echo "  make dev       - Start development environment"
+	@echo "  make deploy    - Deploy to production"
+	@echo "  make test      - Run tests"
+	@echo "  make logs      - View logs"
+	@echo "  make backup    - Backup database"
+	@echo "  make clean     - Clean up containers and volumes"
+
+install:
+	pip install -r backend/requirements.txt
+	cd frontend && npm install
+
+dev:
+	docker-compose up
+
+deploy:
+	./deployment/deploy.sh
+
+test:
+	docker-compose exec backend pytest
+	cd frontend && npm test
+
+logs:
+	docker-compose logs -f
+
+backup:
+	./deployment/backup.sh
+
+clean:
+	docker-compose down -v
+	rm -rf backend/__pycache__
+	rm -rf frontend/node_modules
+
+# Quick commands
+up:
+	docker-compose up -d
+
+down:
+	docker-compose down
+
+restart:
+	docker-compose restart
+
+ps:
+	docker-compose ps
